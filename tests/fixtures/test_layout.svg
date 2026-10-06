@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+     xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+     width="210mm" height="297mm" viewBox="0 0 210 297" id="svgroot">
+  <g id="layer1" inkscape:groupmode="layer" inkscape:label="Layout">
+    <rect id="boxA" x="20" y="20" width="50" height="30" fill="#542788" inkscape:label="Purple box"/>
+    <rect id="boxB" x="90" y="40" width="30" height="60" fill="#e08214" stroke="#000" stroke-width="1"/>
+    <rect id="boxC" x="140" y="25" width="40" height="20" fill="#1b6b3a"/>
+    <g id="grp1" transform="translate(10,150) rotate(0)" inkscape:label="Card">
+      <rect id="cardbg" x="0" y="0" width="80" height="30" rx="3" fill="#dce6f0"/>
+      <text id="t1" x="5" y="12" font-family="Helvetica" font-size="6" fill="#151B36"><tspan id="t1s" x="5" y="12">Original title</tspan></text>
+    </g>
+    <text id="para" x="110" y="160" font-family="Helvetica" font-size="5" style="line-height:1.25" fill="#151B36"><tspan sodipodi:role="line" id="para1" x="110" y="160">First line of a</tspan><tspan sodipodi:role="line" id="para2" x="110" y="166.25">two-line paragraph with <tspan id="boldbit" font-weight="bold">bold</tspan> text</tspan></text>
+    <svg id="fig" x="20" y="200" width="80" height="60" viewBox="0 0 400 300">
+      <rect id="figbg" x="0" y="0" width="400" height="300" fill="#f4f4f4"/>
+      <circle id="dot" cx="200" cy="150" r="80" fill="#4B80AD"/>
+    </svg>
+  </g>
+</svg>

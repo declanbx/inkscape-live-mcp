@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Synthetic legend for the e2e test. Its viewBox (400 x 120 user units) is much larger than its
+     physical size, which is what makes Inkscape 1.4 report a wrong box for the group it is inserted in. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="100mm" height="30mm" viewBox="0 0 400 120">
+  <rect id="frame" x="2" y="2" width="396" height="116" rx="8" fill="#ffffff" stroke="#151b36" stroke-width="4"/>
+  <rect id="sw1" x="20" y="22" width="36" height="22" fill="#542788"/>
+  <text id="lab1" x="66" y="40" font-family="Helvetica" font-size="20" fill="#151b36">First series</text>
+  <rect id="sw2" x="20" y="54" width="36" height="22" fill="#e08214"/>
+  <text id="lab2" x="66" y="72" font-family="Helvetica" font-size="20" fill="#151b36">Second series</text>
+  <rect id="sw3" x="20" y="86" width="36" height="22" fill="#1b6b3a"/>
+  <text id="lab3" x="66" y="104" font-family="Helvetica" font-size="20" fill="#151b36">Third series</text>
+  <circle id="mark" cx="330" cy="60" r="34" fill="#4b80ad"/>
+</svg>
