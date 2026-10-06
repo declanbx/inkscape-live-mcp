@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from inkscape_live_mcp.client import fingerprint, landed  # noqa: E402
+from inkscape_live_mcp.client import fingerprint, inkscape_said, landed  # noqa: E402
 from inkscape_live_mcp.svgtree import PX_PER_MM, Box, Tree, parse_query_all  # noqa: E402
 
 QUERY = "svgroot,0,0,793.701,1122.52\nlayer1,0,0,1511.81,1133.86\nboxA,75.5906,75.5906,188.976,113.386\n"
@@ -45,6 +45,17 @@ def test_landed_added_removed_touched():
     assert landed(before, {**after, "b": before["b"]}, removed=["b"]).startswith("NOT LANDED")
     assert landed(before, after, touched=["a"]).startswith("Landed: confirmed")
     assert landed(before, {"a": before["a"]}, touched=["a"]).startswith("Landed: unconfirmed")
+
+
+def test_inkscape_said():
+    # lines Inkscape 1.4.4 printed in a live window, measured: two refusals, a warning, GTK noise
+    rejected, said = inkscape_said(
+        "action:transform_translate: requires two comma separated numbers\n"
+        "select_by_id: Did not find object with id: nope\n"
+        "Warning: multiple export area types have been set, overriding --export-area with --export-area-page\n"
+        "(org.inkscape.Inkscape:1): Gtk-CRITICAL **: gtk_application_accels_get_actions_for_accel: failed\n\n")
+    assert len(rejected) == 2 and "requires two" in rejected[0]
+    assert said == ["Warning: multiple export area types have been set, overriding --export-area with --export-area-page"]
 
 
 def test_nested_svg_box_correction(tmp_path=None):

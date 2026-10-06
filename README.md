@@ -57,7 +57,7 @@ agent the workflow (route by cost, lay out by numbers, share the window safely).
 
 | Reading | Layout: Inkscape's own commands, ~0.1–1 s, one undo step each | Content: one undo step per batch | Other |
 |---|---|---|---|
-| `status` `outline` `find` `inspect` `selection` `render` (with each object's box and id drawn on) `window` (screenshot of the Inkscape window) `changes` (what you moved, added, removed) | `align` `distribute` (equal or exact gaps) `move` (by or to mm) `resize` (exact visual width/height) `style` `attributes` `structure` (group, z-order, delete, duplicate, reparent) `history` (undo/redo) | `text` (set or find/replace, many at once) `insert` (.svg as live vector, .png/.jpg) `add_svg` (draw anything from SVG markup, in mm) `python` (arbitrary inkex code) | `actions` (any of Inkscape's ~1,070 actions, searchable) `save_copy` `launch` |
+| `status` `outline` `find` `inspect` `selection` `render` (with each object's box and id drawn on) `window` (screenshot of the Inkscape window) `changes` (what you moved, added, removed) | `align` `distribute` (equal or exact gaps) `move` (by or to mm) `resize` (exact visual width/height) `style` `attributes` `structure` (group, z-order, delete, duplicate, reparent) `history` (undo/redo) | `text` (set or find/replace, many at once) `insert` (.svg as live vector, .png/.jpg) `add_svg` (draw anything from SVG markup, in mm) `python` (arbitrary inkex code) | `export` (PDF, SVG, EPS, PS or PNG of the page, the drawing, chosen objects or a region; read back and checked) `actions` (any of Inkscape's ~1,070 actions, searchable; rejections reported) `save_copy` `launch` |
 
 ### Safety nets on every call
 
@@ -75,6 +75,12 @@ agent the workflow (route by cost, lay out by numbers, share the window safely).
 - **No-op batches add no undo step.** The bridge compares the document before and after a batch; if it
   is byte-identical it hands nothing back, so Inkscape adds no undo entry and your next Cmd+Z still
   undoes the last real change.
+- **Exports are read back.** `export` reopens the file it wrote and checks it against what was asked:
+  the PDF page size in mm (read with macOS Quartz), the PNG's pixel size, the SVG's document size, and
+  whether fonts are embedded or text was turned into outlines (`text_to_path=True`).
+- **Raw actions say what Inkscape did.** If Inkscape logs a rejection (`transform-translate abc` →
+  "requires two comma separated numbers"), `actions` returns an error with that reason; otherwise it
+  reports whether the geometry changed, because Inkscape ignores some malformed arguments without a word.
 - **Uncertain completion is reported, never retried.** If Inkscape does not answer in time (a dialog is
   open, a huge document), the call returns `UNCERTAIN COMPLETION` instead of an error or a silent retry:
   the edit may still apply. The next call waits for Inkscape to finish it before reading or editing.
@@ -97,6 +103,8 @@ image), Apple Silicon laptop, through the MCP server:
 | bridge edit (text, add_svg, insert, python) | 3.0–3.2 s |
 | bridge batch that changes nothing | 2.2 s |
 | undo of a bridge edit | 1.2 s |
+| export the page as PDF / one panel as PDF (via a headless copy) | 3.4 s / 3.0 s |
+| export the page as PNG at 150 dpi | 1.1 s |
 
 On a 2,000-object figure everything is under 0.6 s. Bridge edits grow with document size, because
 Inkscape serialises the whole document to the extension and reloads its result: on a real 100,000-element
@@ -119,7 +127,7 @@ takes a list, `add_svg` and `python` take many elements at once.
   `INKSCAPE_MCP_STATE` (default `~/.inkscape-mcp`) its state folder, so several instances can run side by
   side; the test suite uses this to run on its own instance.
 
-## macOS quirks, and how they are handled
+## Quirks, and how they are handled
 
 - **Launch constraints silently disable Python extensions** when Inkscape is exec'd from a shell, so no
   edit through the bridge would work. `launch.sh` therefore starts Inkscape through LaunchServices
@@ -136,6 +144,16 @@ takes a list, `add_svg` and `python` take many elements at once.
   in parent units, to the group's box (an inserted 70 mm legend is reported 105.8 mm wide). The server
   rebuilds those groups' boxes from their children and aligns them with computed moves rather than
   Inkscape's own Align.
+- **Export settings persist inside a running Inkscape, and some cannot be switched back** (measured on
+  1.4.4): once text-to-path is on, setting it off has no effect, and the page/drawing area mode can be
+  changed but never unset. PNG exports therefore pass an explicit area and pixel size every time; PDF,
+  SVG, EPS and PS exports write the live document to a temporary copy, crop the copy to the page, the
+  drawing, the chosen objects or a region, and export it with a fresh headless Inkscape. Your window's
+  export state is never touched, and a region works for PDF too (Inkscape's own vector export ignores one).
+- **Inkscape's own "drawing" area is wrong for documents holding a nested `<svg>`** (the bug below), so
+  `export(area="drawing")` uses the corrected boxes.
+- **Some action arguments are ignored silently.** A bare or misspelled `object-align` does nothing and
+  logs nothing; `transform-translate abc` logs a reason. See "Raw actions say what Inkscape did".
 - `select-by-id` **adds** to the selection: every command clears it first, then restores your selection.
 - `export-area` cannot be cleared once set, so every render passes an explicit area.
 - A saved copy keeps its source's internal document name, so the front window is matched by file name first.
@@ -167,7 +185,7 @@ takes a list, `add_svg` and `python` take many elements at once.
 
 ```sh
 .venv/bin/python tests/test_units.py   # no Inkscape needed
-.venv/bin/python tests/e2e.py          # 47 checks over MCP on a private Inkscape instance
+.venv/bin/python tests/e2e.py          # 62 checks over MCP on a private Inkscape instance
 .venv/bin/python tests/bench.py        # the cost table above
 ```
 
@@ -182,7 +200,8 @@ quit it afterwards (`--keep` leaves it open). They never touch a window you have
   CLI mode and a much broader tool surface, on Linux and Windows (macOS support is an open pull request).
   This project adds layout by Inkscape-measured visual boxes in millimetres (with the nested-`<svg>` box
   correction), exact align/distribute/resize tools, renders annotated with object ids, a change diff and
-  revision guard for editing alongside a person, edit-landed verification, and macOS support today.
+  revision guard for editing alongside a person, edit-landed verification, and macOS support today. The
+  check for actions Inkscape rejected follows its CLI wrapper's stderr scan.
 - [Shriinivas/inkmcp](https://github.com/Shriinivas/inkmcp): live control of a running Inkscape over
   D-Bus with an extension and inkex code execution (Linux).
 - [tspspi/mcpinkscape](https://github.com/tspspi/mcpinkscape): an offline SVG backend plus an optional

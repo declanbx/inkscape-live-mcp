@@ -35,6 +35,8 @@ Colour-only edits do not change the revision. Each edit also reports whether it 
 (the live boxes match the plan), "NOT LANDED" (they do not: look before retrying) or "unconfirmed"
 (a change with no geometric trace, e.g. a colour). "UNCERTAIN COMPLETION" means Inkscape did not answer
 in time: never repeat that edit blindly; check with changes or render first.
+To write PDF/SVG/PNG files use `export`: it crops to the page, the drawing, chosen objects or a region and
+reads the file back to check its size and fonts.
 
 Cost model: layout, style, attribute, z-order, group and delete tools use Inkscape's own commands
 (0.1–1 s, one undo step each). text, insert, add_svg, reparent, non-uniform resize and python go through
@@ -573,8 +575,10 @@ def history(op: str = "undo", n: int = 1, expected_revision: str | None = None) 
 @revisioned
 def actions(run: list | None = None, search: str | None = None, expected_revision: str | None = None) -> str:
     """Run any of Inkscape's ~1,070 actions, or search them. run: ["select-all", ["object-align",
-    "left page"], ["transform-rotate", 90]] — returns what Inkscape printed. search: substring over
-    action names and descriptions. Most act on the current selection; use selection(set_ids=…) first."""
+    "left page"], ["transform-rotate", 90]] — returns what Inkscape printed, any complaint it logged (an
+    action it rejected makes this an error), and whether the geometry changed (Inkscape ignores some
+    malformed arguments silently). search: substring over action names and descriptions. Most act on the
+    current selection; use selection(set_ids=…) first. To write files, prefer export."""
     if search:
         cat = ink.action_catalogue()
         s = search.lower()
@@ -583,12 +587,7 @@ def actions(run: list | None = None, search: str | None = None, expected_revisio
     if not run:
         raise InkError("give run or search")
     acts = [(a, None) if isinstance(a, str) else (a[0], a[1] if len(a) > 1 else None) for a in run]
-    if expected_revision:
-        ink.guarded_boxes(expected_revision)
-    out = ink.run(acts)
-    ink.trees.pop(ink.active_doc(), None)
-    ink.raw_boxes()  # report the revision after whatever the actions did
-    return out.strip() or "(done, nothing printed)"
+    return ink.run_actions(acts, expected_revision=expected_revision)
 
 
 @mcp.tool()
@@ -612,6 +611,23 @@ def python(code: str, readonly: bool = False, timeout_s: float = 900, expected_r
     res = r["results"][0]
     return (f"({r['seconds']} s, {head})\n" + (out + "\n" if out else "")
             + (f"result = {res!r}" if res is not None else ""))
+
+
+@mcp.tool()
+@revisioned
+def export(path: str, area: str = "page", ids: list[str] | None = None, region_mm: list[float] | None = None,
+           dpi: float = 300, text_to_path: bool = False, background: str | None = None, only: bool = True,
+           format: str | None = None) -> str:
+    """Export the live document (unsaved changes included) to PDF, SVG, EPS, PS or PNG; the format comes
+    from the file suffix (or format=). What to export: area='page' (default) or 'drawing' (everything
+    drawn); or ids=[…] for those objects (only=False keeps whatever overlaps them); or region_mm=[x0, y0,
+    x1, y1] (PNG only). dpi: PNG resolution, and the resolution filter effects are rasterised at in
+    PDF/EPS/PS. text_to_path=True turns text into outlines (for printers that cannot take fonts).
+    background: PNG background colour (default transparent). The file is read back afterwards: page size
+    in mm, pixel size, fonts embedded."""
+    r = ink.export(path, area=area, ids=ids, region_mm=region_mm, dpi=dpi, text_to_path=text_to_path,
+                   background=background, only=only, fmt=format)
+    return f"Wrote {r['path']} ({r['size']}) in {r['seconds']} s: {r['facts']}.\n{r['verdict']}"
 
 
 @mcp.tool()

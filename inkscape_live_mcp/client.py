@@ -25,16 +25,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
 import threading
 import time
 import uuid
+import zlib
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .bus import STATE, TAG, CallTimeout, InkscapeBus, PendingCall, UnknownAction
-from .svgtree import PX_PER_MM, Box, Tree, local, mm, page_size_px, parse_query_all, qname
+from .svgtree import NS, PX_PER_MM, SKIP, Box, Tree, local, mm, page_size_px, parse_query_all, parse_style, qname
 
 LAUNCH = Path(__file__).resolve().parent.parent / "launch.sh"
 INKSCAPE_BIN = os.environ.get("INKSCAPE_BIN", "/Applications/Inkscape.app/Contents/MacOS/inkscape")
@@ -44,6 +46,13 @@ EDGES_V = ("top", "vcenter", "bottom")
 NATIVE_ALIGN_TARGETS = ("first", "last", "biggest", "smallest", "page", "drawing", "selection")
 TOL = 0.01 * PX_PER_MM          # "where planned" tolerance: 0.01 mm
 SNAPSHOTS = 6                   # revisions kept in memory so a refusal can say what changed
+EXPORT_FORMATS = ("png", "pdf", "svg", "eps", "ps")
+# What Inkscape prints to stderr when it refuses an action ("action:transform_translate: requires two
+# comma separated numbers", "select_by_id: Did not find object with id: x"). Many refusals print nothing
+# at all (a bare or misspelled object-align), which is why raw actions also report whether geometry changed.
+STDERR_NOISE = re.compile(r"accelerator|Gtk-CRITICAL|Gtk-WARNING|^\s*$")
+REJECTION = re.compile(r"requires|did not find|invalid|error|failed|unknown|not found|could not|cannot|can't|unable",
+                       re.IGNORECASE)
 
 
 class InkError(RuntimeError):
@@ -82,6 +91,38 @@ def _same(a: Box, b: Box, tol: float = TOL) -> bool:
 
 def _shift(b: Box, d: tuple[float, float]) -> Box:
     return Box(b.x + d[0], b.y + d[1], b.w, b.h)
+
+
+def inkscape_said(stderr: str) -> tuple[list[str], list[str]]:
+    """Split what Inkscape printed to stderr into (rejections, other messages), dropping GTK noise."""
+    lines = [ln.strip() for ln in stderr.splitlines() if not STDERR_NOISE.search(ln)]
+    rejected = [ln for ln in lines if REJECTION.search(ln) and not ln.lower().startswith("warning")]
+    return rejected, [ln for ln in lines if ln not in rejected]
+
+
+def pdf_facts(path: Path) -> tuple[int, float, float, bool] | None:
+    """(pages, width mm, height mm, fonts embedded) of a PDF, read with Quartz; None if unreadable."""
+    try:
+        import Quartz
+    except ImportError:
+        return None
+    raw = str(path).encode()
+    doc = Quartz.CGPDFDocumentCreateWithURL(Quartz.CFURLCreateFromFileSystemRepresentation(None, raw, len(raw), False))
+    if doc is None:
+        return None
+    r = Quartz.CGPDFPageGetBoxRect(Quartz.CGPDFDocumentGetPage(doc, 1), Quartz.kCGPDFMediaBox)
+    data = path.read_bytes()
+    font = re.compile(rb"/Type\s*/Font\b|/FontFile")
+    fonts = bool(font.search(data))
+    for m in re.finditer(rb"stream\r?\n", data) if not fonts else ():
+        end = data.find(b"endstream", m.end())
+        try:
+            if font.search(zlib.decompress(data[m.end():end])):
+                fonts = True
+                break
+        except zlib.error:
+            continue
+    return Quartz.CGPDFDocumentGetNumberOfPages(doc), r.size.width * 25.4 / 72, r.size.height * 25.4 / 72, fonts
 
 
 def landed(before: dict[str, Box], after: dict[str, Box], *, exact: dict[str, Box] | None = None,
@@ -946,6 +987,7 @@ class Inkscape:
         path = Path(path).expanduser().resolve() if path else (STATE / "renders" / f"render-{int(time.time() * 1000)}.png")
         path.unlink(missing_ok=True)
         acts = [("export-type", "png"), ("export-plain-svg", False),
+                ("export-height", 0),  # export settings persist between calls; a height set earlier would stretch this
                 ("export-id", ",".join(only_ids) if only_ids else ""), ("export-id-only", bool(only_ids)),
                 ("export-area", f"{area.x:.3f}:{area.y:.3f}:{area.x2:.3f}:{area.y2:.3f}"),
                 ("export-width", int(width_px)), ("export-background", background),
@@ -963,6 +1005,161 @@ class Inkscape:
         path = path or (STATE / "renders" / f"window-{int(time.time() * 1000)}.png")
         subprocess.run(["screencapture", "-x", "-o", f"-l{titles[0][0]}", str(path)], check=True, timeout=30)
         return path
+
+    def drawing_box(self, boxes: dict[str, Box]) -> Box:
+        """Union of the top-level objects' corrected boxes (Inkscape's own drawing area can be wrong)."""
+        return Box.union(boxes[i] for i in self._top_ids(boxes))
+
+    def _top_ids(self, boxes) -> list[str]:
+        t = self.trees[self.active_doc()]
+        return [c.get("id") for c in t.visible_children(t.root) if c.get("id") in boxes and boxes[c.get("id")].w > 0]
+
+    def export(self, path, *, area: str = "page", ids: list[str] | None = None, region_mm=None, dpi: float = 300.0,
+               text_to_path: bool = False, background: str | None = None, only: bool = True,
+               fmt: str | None = None) -> dict:
+        """Write the live document to a file and read the file back. Returns path, size, facts, verdict.
+
+        PNG is exported by the live Inkscape with an explicit area and pixel size. PDF/SVG/EPS/PS are not:
+        Inkscape's export settings persist inside a running instance and some cannot be switched back
+        (text-to-path, once on, stays on; the area mode cannot be unset), so a vector export writes the
+        live document to a temporary copy, crops that copy to the wanted box, and has a fresh headless
+        Inkscape export it."""
+        p = Path(path).expanduser().resolve()
+        fmt = (fmt or p.suffix.lstrip(".")).lower()
+        if fmt not in EXPORT_FORMATS:
+            raise InkError(f"format must be one of {EXPORT_FORMATS} (from the file suffix or format=)")
+        self.ensure_tree()
+        _, boxes = self.boxes()
+        if ids:
+            self._check_ids(ids, boxes)
+            want, what = Box.union(boxes[i] for i in ids), f"{len(ids)} object(s)"
+        elif region_mm:
+            x0, y0, x1, y1 = region_mm
+            want, what = Box(px(x0), px(y0), px(x1 - x0), px(y1 - y0)), "region"
+        elif area in ("page", "drawing"):
+            want, what = (self.page_box() if area == "page" else self.drawing_box(boxes)), area
+        else:
+            raise InkError("area is 'page' or 'drawing' (or pass ids / region_mm)")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.unlink(missing_ok=True)
+        t0 = time.monotonic()
+        w_px = max(1, round(want.w / 96 * dpi))
+        if fmt == "png":
+            acts = [("export-type", "png"), ("export-plain-svg", False), ("export-dpi", float(dpi)),
+                    ("export-id", ",".join(ids) if (ids and only) else ""), ("export-id-only", bool(ids and only)),
+                    ("export-area", f"{want.x:.3f}:{want.y:.3f}:{want.x2:.3f}:{want.y2:.3f}"),
+                    ("export-width", w_px), ("export-height", 0)]
+            acts += ([("export-background", background), ("export-background-opacity", 1.0)] if background
+                     else [("export-background-opacity", 0.0)])
+            self.run(acts + [("export-overwrite", True), ("export-filename", str(p)), ("export-do", None)])
+            stderr = self.bus.last_stderr
+        else:
+            stderr = self._export_vector(p, fmt, None if what == "page" else want, ids if only else None,
+                                         dpi, text_to_path)
+        rejected, _ = inkscape_said(stderr)
+        if not p.exists() or p.stat().st_size == 0:
+            raise InkError(f"export to {p} failed" + (": " + " | ".join(rejected) if rejected else
+                           f" (no file written; see {STATE / 'inkscape.err.log'})"))
+        size = f"{p.stat().st_size / 1e6:.2f} MB"
+        wmm, hmm = mm(want.w), mm(want.h)
+        bad, facts, checked = [], fmt.upper(), True
+        if fmt == "png":
+            from PIL import Image
+            with Image.open(p) as im:
+                W, H = im.size
+            facts = f"PNG {W}×{H} px ({wmm:.1f}×{hmm:.1f} mm at {dpi:g} dpi)"
+            if abs(W - w_px) > 1 or abs(H - want.h / want.w * w_px) > 1.5:
+                bad.append(f"image is {W}×{H} px, planned {w_px}×{round(want.h / want.w * w_px)}")
+        elif fmt == "pdf" and (f := pdf_facts(p)) is not None:
+            n, pw, ph, fonts = f
+            facts = (f"PDF, {n} page{'s' if n != 1 else ''}, {pw:.1f}×{ph:.1f} mm, "
+                     + ("fonts embedded" if fonts else "no fonts (text as outlines)" if text_to_path else "no fonts"))
+            if abs(pw - wmm) > 0.15 or abs(ph - hmm) > 0.15:
+                bad.append(f"page is {pw:.1f}×{ph:.1f} mm, the {what} measures {wmm:.1f}×{hmm:.1f} mm")
+            if text_to_path and fonts:
+                bad.append("fonts are still embedded although text_to_path was asked for")
+        elif fmt == "svg":
+            from lxml import etree
+            sw, sh = page_size_px(etree.parse(str(p), etree.XMLParser(huge_tree=True)).getroot())
+            facts = f"SVG, {mm(sw):.1f}×{mm(sh):.1f} mm"
+            if abs(mm(sw) - wmm) > 0.15 or abs(mm(sh) - hmm) > 0.15:
+                bad.append(f"document is {mm(sw):.1f}×{mm(sh):.1f} mm, the {what} measures {wmm:.1f}×{hmm:.1f} mm")
+        else:
+            checked = False
+        if bad:
+            verdict = "NOT LANDED as planned: " + "; ".join(bad)
+        elif not checked or facts == "PDF":
+            verdict = "Landed: unconfirmed — the size of this format is not read back."
+        else:
+            verdict = f"Landed: confirmed (size matches the {what} to 0.15 mm" + (" / 1 px)." if fmt == "png" else ").")
+        return {"path": p, "size": size, "facts": facts, "verdict": verdict,
+                "seconds": round(time.monotonic() - t0, 2)}
+
+    def _export_vector(self, out: Path, fmt: str, box: Box | None, only_ids: list[str] | None, dpi: float,
+                       text_to_path: bool) -> str:
+        """Copy the live document to a temporary SVG (no reload), crop the copy to `box` (None keeps the
+        page), hide everything but `only_ids`, and export it with a fresh headless Inkscape. Returns its stderr."""
+        from lxml import etree
+        tmpdir = STATE / "exports"
+        tmpdir.mkdir(mode=0o700, exist_ok=True)
+        tmp = tmpdir / f"export-{uuid.uuid4().hex}.svg"
+        try:
+            self.bridge([{"op": "dump", "path": str(tmp)}], dump=False)
+            tree = etree.parse(str(tmp), etree.XMLParser(huge_tree=True))
+            root = tree.getroot()
+            src = self.info(self.active_doc()).get("file")
+            href = "{%s}href" % NS["xlink"]
+            for im in root.iter("{%s}image" % NS["svg"]):  # linked images must still resolve from the temp folder
+                for key in (href, "href"):
+                    v = im.get(key)
+                    if src and v and not v.startswith(("data:", "http:", "https:", "file:", "/")):
+                        im.set(key, str((Path(src).parent / v).resolve()))
+            if box is not None:
+                w_px, _ = page_size_px(root)
+                vb = [float(v) for v in (root.get("viewBox") or "").replace(",", " ").split()] or [0.0, 0.0, w_px, 0.0]
+                s = w_px / vb[2] if vb[2] else 1.0  # document px per user unit
+                root.set("viewBox", f"{box.x / s + vb[0]:.6f} {box.y / s + vb[1]:.6f} {box.w / s:.6f} {box.h / s:.6f}")
+                root.set("width", f"{mm(box.w):.6f}mm")
+                root.set("height", f"{mm(box.h):.6f}mm")
+                for nv in root.iter("{%s}namedview" % NS["sodipodi"]):  # extra pages would override the viewBox
+                    for pg in list(nv.iter("{%s}page" % NS["inkscape"])):
+                        pg.getparent().remove(pg)
+            if only_ids:
+                by_id = {e.get("id"): e for e in root.iter() if isinstance(e.tag, str) and e.get("id")}
+                targets = [by_id[i] for i in only_ids if i in by_id]
+                chain = {a for t in targets for a in t.iterancestors()}
+                keep = chain | set(targets)
+                for a in chain:
+                    for c in a:
+                        if isinstance(c.tag, str) and c not in keep and local(c) not in SKIP:
+                            st = parse_style(c.get("style"))
+                            st["display"] = "none"
+                            c.set("style", ";".join(f"{k}:{v}" for k, v in st.items()))
+            tree.write(str(tmp), xml_declaration=True, encoding="UTF-8")
+            env = {k: v for k, v in os.environ.items() if k != "DBUS_SESSION_BUS_ADDRESS"}  # never reach a live instance
+            cmd = [INKSCAPE_BIN, str(tmp), f"--export-type={fmt}", f"--export-filename={out}", "--export-area-page",
+                   "--export-overwrite", f"--export-dpi={dpi:g}"] + (["--export-text-to-path"] if text_to_path else [])
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+            return r.stderr
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def run_actions(self, acts, *, expected_revision: str | None = None) -> str:
+        """Raw Inkscape actions, with Inkscape's own complaints surfaced and the geometric effect reported."""
+        self.guarded_boxes(expected_revision)
+        rev0 = self.revision
+        out = self.run(acts)
+        rejected, said = inkscape_said(self.bus.last_stderr)
+        self.trees.pop(self.active_doc(), None)
+        self.raw_boxes()
+        effect = (f"Geometry changed (revision {rev0} → {self.revision})." if self.revision != rev0 else
+                  "No geometric change. Expected for selection, export or colour actions; if you expected "
+                  "something to move, check the arguments: Inkscape 1.4 ignores some malformed ones without "
+                  "a message (a bare or misspelled object-align does nothing).")
+        if rejected:
+            raise InkError("Inkscape rejected an action: " + " | ".join(rejected)
+                           + f"\nActions listed before it may have run. {effect}")
+        return "\n".join(x for x in [out.strip(), ("Inkscape said: " + " | ".join(said)) if said else "", effect] if x)
 
     # ======================================================================== misc
     def action_catalogue(self) -> dict[str, str]:

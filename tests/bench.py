@@ -96,6 +96,10 @@ async def main(ink):
         await timed("bridge batch that changes nothing", "text", edits=[{"id": "title0", "text": "Edited title"}])
         await timed("undo of a bridge edit", "history", op="undo")
         await timed("outline, first read of an edited document (via the bridge)", "outline", depth=1, max_lines=60, refresh=True)
+        out = _instance.TMP / "exports"
+        await timed("export the page as PDF", "export", path=str(out / "page.pdf"))
+        await timed("export one panel as PDF", "export", path=str(out / "panel.pdf"), ids=["panel3"])
+        await timed("export the page as PNG at 150 dpi", "export", path=str(out / "page.png"), dpi=150)
     return rows
 
 

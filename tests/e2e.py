@@ -226,6 +226,50 @@ async def main(ink: Inkscape):
         check("actions reach documents without /window/N objects", "document" in kids, f"children {kids}")
         print(f"  info: GTK exports /window/N objects here: {'window' in kids}")
 
+        # ---------------------------------------------------------------- raw actions report what Inkscape did
+        a0 = box("boxA")
+        res, out = await call("actions", run=["select-clear", ["select-by-id", "boxA"], ["transform-translate", "abc"]])
+        check("a rejected raw action is an error carrying Inkscape's reason",
+              res.is_error and "requires two comma separated numbers" in out, out[:100])
+        check("the rejected action moved nothing", abs(box("boxA").x - a0.x) < 1e-6 and abs(box("boxA").y - a0.y) < 1e-6)
+        res, out = await call("actions", run=["select-clear", ["select-by-id", "boxA,boxB"], ["object-align", "sideways"]])
+        check("a silently ignored action is reported as no geometric change", not res.is_error and "No geometric change" in out)
+        res, out = await call("actions", run=["select-clear", ["select-by-id", "dot"], ["transform-translate", "3.7795,0"],
+                                              "select-clear"])
+        check("a raw action that moves something says so", not res.is_error and "Geometry changed" in out)
+        await call("history", op="undo")
+
+        # ---------------------------------------------------------------- export, read back after writing
+        X = OUT / "exports"
+        _, out = await call("export", path=str(X / "page.pdf"))
+        check("PDF of the page: 210×297 mm with fonts, verified",
+              "210.0×297.0 mm" in out and "fonts embedded" in out and "Landed: confirmed" in out)
+        _, out = await call("export", path=str(X / "outlines.pdf"), text_to_path=True)
+        check("text_to_path leaves no fonts in the PDF", "no fonts" in out and "Landed: confirmed" in out)
+        _, out = await call("export", path=str(X / "page_again.pdf"))
+        check("text_to_path does not leak into the next export", "fonts embedded" in out)
+        lg = box("legend")
+        _, out = await call("export", path=str(X / "legend.pdf"), ids=["legend"])
+        check("PDF of a nested-svg group is sized from the corrected box",
+              "Landed: confirmed" in out and f"{mm(lg.w):.1f}×{mm(lg.h):.1f} mm" in out, out[:200])
+        _, out = await call("export", path=str(X / "drawing.pdf"), area="drawing")
+        check("PDF of the drawing is sized from the corrected boxes", "Landed: confirmed" in out, out[:200])
+        _, out = await call("export", path=str(X / "region.png"), region_mm=[20, 20, 120, 70], dpi=150)
+        check("PNG of a 100 mm region at 150 dpi is 591 px wide, verified", "591×" in out and "Landed: confirmed" in out)
+        ink.tree(refresh=True)  # this test's own cached tree may be stale; the corrected boxes depend on it
+        d = ink.drawing_box(ink.boxes()[1])
+        _, out = await call("export", path=str(X / "drawing.png"), area="drawing", dpi=96)
+        check("PNG of the drawing uses the corrected drawing box", f"{round(d.w)}×" in out and "Landed: confirmed" in out,
+              f"expected {round(d.w)} px wide; {out[:120]}")
+        _, out = await call("export", path=str(X / "card.svg"), ids=["grp1"])
+        check("SVG of one object, verified", "Landed: confirmed" in out, out[:200])
+        _, out = await call("export", path=str(X / "region.pdf"), region_mm=[20, 20, 120, 70])
+        check("PDF of a region is cropped to it (100×50 mm)", "100.0×50.0 mm" in out and "Landed: confirmed" in out, out[:200])
+        _, out = await call("export", path=str(X / "card.png"), ids=["grp1"], dpi=200, background="#ffffff")
+        check("PNG of one object on white, verified", "Landed: confirmed" in out, out[:200])
+        _, out = await call("render", region_mm=[0, 0, 100, 50], width_px=400)
+        check("renders are unaffected by earlier exports (400×200 px)", "400×200 px" in out, out[:120])
+
         # ---------------------------------------------------------------- escape hatches
         _, out = await call("python", code="result = len(svg.xpath('//svg:rect', namespaces={'svg':'http://www.w3.org/2000/svg'}))", readonly=True)
         check("python readonly", "result =" in out)

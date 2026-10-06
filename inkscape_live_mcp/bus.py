@@ -116,6 +116,8 @@ class OutLog:
 
     def read_new(self, settle: float = 0.03, timeout: float = 3.0) -> str:
         """Return text printed since the last mark; wait until the file stops growing."""
+        if not self.path.exists():
+            return ""
         t0 = time.monotonic()
         last = -1
         while time.monotonic() - t0 < timeout:
@@ -140,6 +142,8 @@ class InkscapeBus:
         self.conn = None
         self._describe: dict[str, dict[str, str]] = {}
         self.out = OutLog(STATE / "inkscape.out.log")
+        self.err = OutLog(STATE / "inkscape.err.log")
+        self.last_stderr = ""  # what Inkscape wrote to stderr during the last run()
 
     # ---- connection -------------------------------------------------------------------------
     def connect(self):
@@ -250,7 +254,10 @@ class InkscapeBus:
     def run(self, actions, path: str = APP_PATH) -> str:
         """Run [(name, value), ...] in order and return everything Inkscape printed meanwhile."""
         self.out.mark()
+        self.err.mark()
         for item in actions:
             name, value = (item, None) if isinstance(item, str) else (item[0], item[1] if len(item) > 1 else None)
             self.activate(name, value, path=path)
-        return self.out.read_new()
+        out = self.out.read_new()
+        self.last_stderr = self.err.read_new(settle=0.0, timeout=0.2)  # stdout has already settled
+        return out

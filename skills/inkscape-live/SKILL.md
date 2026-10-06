@@ -43,6 +43,11 @@ read live from Inkscape. To drive it from a script instead, put the checkout on 
 
 So: batch every bridge edit into one call (`text` takes a list; `python`/`add_svg` take many elements).
 
+Files out: `export(path, area="page"|"drawing" | ids=[…] | region_mm=[…], dpi=…, text_to_path=…)` writes
+PDF/SVG/EPS/PS/PNG and reads the file back (page size in mm, pixels, fonts). Use it, not raw export actions:
+Inkscape's export settings stick between calls inside a running instance. `text_to_path=True` for printers
+that cannot take fonts.
+
 ## Lay out by numbers, look only for taste
 
 Read boxes (`find`, `inspect`), compute the target, apply `align(to=<id> | to_mm=…)`, `distribute(gap_mm=…)`,
