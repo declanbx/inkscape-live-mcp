@@ -1,8 +1,9 @@
 """Read-side model of a live Inkscape document: the XML tree (cached) joined to live bounding boxes.
 
 Bounding boxes always come from Inkscape's query-all (visual boxes in document px, page top-left
-origin). The XML tree is a cached copy and may lag the live document for style/text edits that
-moved nothing; Inkscape.tree() refreshes it whenever the set of object ids changes.
+origin). The XML tree is a cached copy; Inkscape.tree() re-reads it whenever the document's revision
+(boxes plus a content hash) changed in a way the server did not make itself, or, on documents too big for
+content tracking, whenever the set of object ids changes.
 """
 from __future__ import annotations
 

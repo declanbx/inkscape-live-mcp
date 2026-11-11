@@ -18,31 +18,13 @@ from .svgtree import LABEL, NS, SKIP, TEXTY, Box, local, mm, parse_style, short,
 NSMAP_REV = {k: "{%s}" % v for k, v in NS.items() if k != "svg"}
 
 INSTRUCTIONS = """\
-Live, shared control of the Inkscape window the user is working in. Edits appear in their window
-immediately and land on Inkscape's undo stack (they can Cmd+Z you). All coordinates are millimetres
-from the page's top-left corner, measured on VISUAL bounding boxes (stroke and text glyphs included),
-read live from Inkscape — exact, so align/distribute/move are one-shot: never nudge-render-repeat.
-
-Typical loop: status → outline / find (ids) → render(annotate=…) to SEE what the ids are →
-align / distribute / move / resize / style → render(around=ids) to check taste, not position.
-Collaborating: call `changes` to see what the user moved/added since you last looked, and
-`selection` to act on what they have selected ("align these").
-
-Every read and edit ends with `revision <id>`, a fingerprint of every object's id and box. Pass it
-back as expected_revision to an edit and the edit is refused (nothing changes) if the user has moved,
-added, removed or resized anything since — use it whenever the user is working in the window too.
-Colour-only edits do not change the revision. Each edit also reports whether it LANDED: "confirmed"
-(the live boxes match the plan), "NOT LANDED" (they do not: look before retrying) or "unconfirmed"
-(a change with no geometric trace, e.g. a colour). "UNCERTAIN COMPLETION" means Inkscape did not answer
-in time: never repeat that edit blindly; check with changes or render first.
-To write PDF/SVG/PNG files use `export`: it crops to the page, the drawing, chosen objects or a region and
-reads the file back to check its size and fonts.
-
-Cost model: layout, style, attribute, z-order, group and delete tools use Inkscape's own commands
-(0.1–1 s, one undo step each). text, insert, add_svg, reparent, non-uniform resize and python go through
-an extension that reloads the whole document: ~0.5 s on a figure, ~3 s on 50k objects, up to ~16 s on a
-large poster with clipped figures, one undo step per call — so BATCH them (text takes a list of edits).
-Renders take ~1 s.
+Live, shared control of the Inkscape window the user is working in: edits appear there at once and sit
+on their undo stack (Cmd+Z). Load the `inkscape-live` skill before the first call; it has the workflow
+and the cost of each tool. Coordinates are millimetres from the page's top-left, on visual boxes.
+Every result ends with `revision <id>`. Pass it back as expected_revision and the edit is refused,
+changing nothing, if the document changed since (geometry, text, colour or images). Read each edit's
+verdict: "Landed: confirmed", "NOT LANDED" (look before retrying) or "unconfirmed". After
+"UNCERTAIN COMPLETION" never repeat the edit: check changes or render first.
 """
 
 mcp = MCPServer("inkscape", instructions=INSTRUCTIONS)
@@ -67,22 +49,36 @@ def revisioned(fn):
     replaces any other exception with a bare "Error executing tool")."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        reads = ink.reads
-        try:
-            out = fn(*args, **kwargs)
-        except UncertainCompletion as e:
-            return str(e)
-        except (InkError, NotRunning, UnknownAction) as e:
-            raise ToolError(str(e)) from e
-        if ink.reads == reads or not ink.revision:
-            return out
-        tag = f"revision {ink.revision}"
+        # One lock for the whole call, so another agent's edit cannot fall between this call's revision
+        # check and its edit, and the revision reported is this call's own (the lock is re-entrant).
+        with ink.lock:
+            reads = ink.reads
+            ink.begin_call()
+            try:
+                out = fn(*args, **kwargs)
+            except UncertainCompletion as e:
+                return _prefix(ink.take_notes(), str(e))
+            except (InkError, NotRunning, UnknownAction) as e:
+                raise ToolError(_prefix(ink.take_notes(), str(e))) from e
+            tag = None
+            if ink.reads != reads:
+                try:
+                    ink.full_read(reuse=True)  # the revision covers this call's end state, content included
+                    tag = f"revision {ink.revision}" + ("" if ink.content_tracked else
+                                                        f" (geometry only: {ink.untracked_reason})")
+                except Exception:
+                    tag = None
+            notes = ink.take_notes()
         if isinstance(out, str):
-            return f"{out}\n{tag}"
+            return _prefix(notes, out) + (f"\n{tag}" if tag else "")
         if isinstance(out, list) and out and isinstance(out[0], str):
-            return [f"{out[0]}\n{tag}"] + out[1:]
+            return [_prefix(notes, out[0]) + (f"\n{tag}" if tag else "")] + out[1:]
         return out
     return wrapper
+
+
+def _prefix(notes: str, text: str) -> str:
+    return f"{notes}\n{text}" if notes else text
 
 
 MAX_SIDE = 1900  # images over ~2000 px on a side are downscaled before Claude sees them

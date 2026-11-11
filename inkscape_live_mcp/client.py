@@ -12,10 +12,12 @@ All coordinates crossing this API are millimetres from the page's top-left corne
 everything is document px (96/in), the frame of query-all and transform-translate.
 
 Two safety nets wrap every edit:
-  * REVISION — a fingerprint of Inkscape's live boxes (every object's id and visual box, in document
-    order). Each read records it; each edit takes an optional expected_revision and refuses, changing
-    nothing, if the person has moved, added, removed or reshaped anything since. Colour-only edits do
-    not change it (Inkscape reports geometry, not paint).
+  * REVISION — a fingerprint of the live document: every object's id and visual box, in document order
+    (query-all), plus a hash of the document's content as Inkscape itself serialises it (a plain-SVG
+    export: text, colours, images, transforms). Each tool call records it; each edit takes an optional
+    expected_revision and refuses, changing nothing, if the person has changed anything they could see
+    since. Documents over CONTENT_MAX objects fall back to geometry only (the export costs ~40 µs per
+    object), and every result then says so.
   * LANDED — after an edit the touched objects' live boxes are compared with what the edit planned
     (exact positions, shared edges, equal gaps, new ids present, deleted ids gone), so a call reports
     "confirmed", "NOT LANDED" or "unconfirmed" (an edit with no geometric trace, e.g. a colour).
@@ -47,6 +49,20 @@ NATIVE_ALIGN_TARGETS = ("first", "last", "biggest", "smallest", "page", "drawing
 TOL = 0.01 * PX_PER_MM          # "where planned" tolerance: 0.01 mm
 SNAPSHOTS = 6                   # revisions kept in memory so a refusal can say what changed
 EXPORT_FORMATS = ("png", "pdf", "svg", "eps", "ps")
+# Content tracking exports the live document as plain SVG once per tool call (measured headless 2026-11-10:
+# ~2 s at 50,000 objects, ~0.2 s at 5,000, tens of ms for a figure). Above this many objects the revision
+# covers geometry only, as it did before, and says so.
+CONTENT_MAX = int(os.environ.get("INKSCAPE_MCP_CONTENT_MAX", 15000))
+# Export settings for that hash. Plain SVG drops the namedview (zoom, scroll, window), so looking around
+# the canvas never changes the revision; the output does not depend on the export area, width, dpi or
+# background another call left set (measured headless 2026-11-10: byte-identical across all four).
+CONTENT_EXPORT = (("export-type", "svg"), ("export-plain-svg", True), ("export-id", ""), ("export-id-only", False),
+                  ("export-overwrite", True))
+# Default-named renders and window shots kept in STATE/renders (each image is also returned inline). Older
+# ones are moved out with the `quarantine` command (this machine's rule: code never deletes files), in
+# batches of PRUNE_BATCH so a render does not start a process every time.
+KEEP_RENDERS = 20
+PRUNE_BATCH = 10
 # What Inkscape prints to stderr when it refuses an action ("action:transform_translate: requires two
 # comma separated numbers", "select_by_id: Did not find object with id: x"). Many refusals print nothing
 # at all (a bare or misspelled object-align), which is why raw actions also report whether geometry changed.
@@ -57,6 +73,43 @@ REJECTION = re.compile(r"requires|did not find|invalid|error|failed|unknown|not 
 
 class InkError(RuntimeError):
     pass
+
+
+def last_query_block(text: str) -> str:
+    """The last complete query-all listing in `text`. A command that timed out can print its own listing
+    into the next call's capture window; the listing always starts with the root, so keep only the lines
+    from the root's last appearance on (a doubled read otherwise gives a revision that matches nothing)."""
+    lines = text.splitlines()
+    ids = [(n, ln.rsplit(",", 4)[0]) for n, ln in enumerate(lines) if len(ln.rsplit(",", 4)) == 5]
+    if not ids:
+        return text
+    root = ids[0][1]
+    start = max(n for n, i in ids if i == root)
+    return "\n".join(lines[start:])
+
+
+def norm_css(v) -> str:
+    """A style value in a comparable spelling: case, quotes and spacing dropped, rgb() and #abc as #aabbcc,
+    numbers without trailing zeros. '2, 1' == '2,1'; 'rgb(75,128,173)' == '#4B80AD'."""
+    s = str(v).strip().lower().replace('"', "").replace("'", "")
+    s = re.sub(r"rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)",
+               lambda m: "#" + "".join(f"{int(g):02x}" for g in m.groups()), s)
+    s = re.sub(r"#([0-9a-f])([0-9a-f])([0-9a-f])\b", r"#\1\1\2\2\3\3", s)
+    out = []
+    for t in (t for t in re.split(r"[\s,]+", s) if t):
+        try:
+            out.append(f"{float(t):g}")
+        except ValueError:
+            out.append(t)
+    return ",".join(out)
+
+
+def _stat_key(path: Path):
+    try:
+        st = path.stat()
+        return st.st_mtime_ns, st.st_size
+    except FileNotFoundError:
+        return None
 
 
 class RevisionConflict(InkError):
@@ -222,6 +275,21 @@ class Inkscape:
         self.reads = 0                            # query-all reads so far (tools report a revision only if they read)
         self._snapshots: OrderedDict[str, str] = OrderedDict()  # revision -> raw query-all text
         self._pending: PendingCall | None = None  # a bridge activation that timed out, still running
+        self._pending_rid: str | None = None      # its request id, to read whether it applied once it ends
+        self.tree_rev: dict[str, str] = {}        # doc path -> revision the cached tree is known to match
+        self._fresh: set[str] = set()             # docs whose cached tree was just read from the live document
+        self.geom_rev: str | None = None          # fingerprint of the last query-all alone
+        self.content_tracked = True               # False: the last revision covers geometry only
+        self.untracked_reason = ""
+        self.notes: list[str] = []                # things the next tool result must tell the agent
+        self.last_action_stderr = ""              # Inkscape's stderr from the edit inside with_selection
+        self._instance = None                     # (bus connection, unique bus name) of the Inkscape we cached
+        self._runs = 0                            # native runs so far
+        self._full_run = -1                       # value of _runs right after the last full read
+        self._last_full = None
+        self._content_ok = False                  # the last full read wrote a fresh content export
+        self._pre_rev: str | None = None          # revision read just before the current edit
+        self._n_objects = 0
         for sub in ("renders", "live", "bridge"):
             (STATE / sub).mkdir(mode=0o700, parents=True, exist_ok=True)
 
@@ -241,8 +309,40 @@ class Inkscape:
                 time.sleep(0.4)
             raise InkError("Inkscape did not come up (or the file did not open) within %.0f s" % wait)
 
-    def documents(self) -> list[str]:
+    def _require(self):
+        """bus.require(), and drop everything cached about documents when Inkscape is not the instance it
+        was: a restarted Inkscape numbers its first document /document/1 again, so a path alone would hand
+        back the old document's page size, name, tree and boxes. The instance is the bus connection plus
+        Inkscape's unique bus name (':1.N', never reused while the bus daemon lives)."""
         self.bus.require()
+        ident = (getattr(self.bus, "generation", 0), getattr(self.bus, "owner", None))
+        if ident != self._instance:
+            if self._instance is not None:
+                self._forget()
+                self.notes.append("Inkscape was restarted (or its connection replaced) since the last call: "
+                                  "everything cached about its documents was dropped and is re-read.")
+            self._instance = ident
+
+    def _forget(self):
+        for d in (self.trees, self.tree_ids, self.tree_rev, self.docinfo, self.baseline, self.base_rev,
+                  self._snapshots):
+            d.clear()
+        self._fresh.clear()
+        self.revision = self.geom_rev = self._pre_rev = self._last_full = None
+        self._full_run = -1
+        self.bus._describe.clear()
+
+    def take_notes(self) -> str:
+        out, self.notes = "\n".join(self.notes), []
+        return out
+
+    def begin_call(self):
+        """Start of a tool call: a full read from an earlier call is never reused."""
+        self._full_run = -1
+        self._last_full = None
+
+    def documents(self) -> list[str]:
+        self._require()
         return self.bus.document_paths()
 
     def window_titles(self) -> list[tuple[int, str]]:
@@ -299,12 +399,13 @@ class Inkscape:
                        "click the window you want me to work in, or close the others.")
 
     # ======================================================================== native layer
-    def run(self, actions) -> str:
+    def run(self, actions, path: str | None = None) -> str:
         with self.lock:
-            self.bus.require()
+            self._require()
             self._settle_pending()  # never read or act on a document an unfinished edit is about to replace
+            self._runs += 1
             try:
-                return self.bus.run(actions)
+                return self.bus.run(actions, **({"path": path} if path else {}))
             except TimeoutError:
                 raise UncertainCompletion(
                     "UNCERTAIN COMPLETION: Inkscape did not answer this command in time (a dialog may be "
@@ -312,14 +413,62 @@ class Inkscape:
 
     def raw_boxes(self) -> tuple[list[str], dict[str, Box]]:
         """Inkscape's own visual boxes (document px), in document order. Records the revision."""
-        text = self.run(["query-all"])
+        order, boxes, _ = self._query(self.run(["query-all"]))
+        return order, boxes
+
+    def _query(self, raw: str):
+        text = last_query_block(raw)
         order, boxes = parse_query_all(text)
-        self.revision = fingerprint(order, boxes)
+        if not order:
+            raise InkError("Inkscape's query-all returned no objects (busy, a dialog open, or the output was "
+                           "lost), so nothing was read and nothing was edited. Try again; call window if it persists.")
+        self.geom_rev = fingerprint(order, boxes)
         self.reads += 1
-        self._snapshots[self.revision] = text
-        self._snapshots.move_to_end(self.revision)
-        while len(self._snapshots) > SNAPSHOTS:
-            self._snapshots.popitem(last=False)
+        self._n_objects = len(order)
+        return order, boxes, text
+
+    def full_read(self, force_content: bool = False, reuse: bool = False) -> tuple[list[str], dict[str, Box]]:
+        """Boxes plus the content hash, in one locked run; sets self.revision. `force_content` writes the
+        plain-SVG export even on a document over CONTENT_MAX (for read-back) without changing what the
+        revision covers. `reuse` returns the last full read if no command has run since (same call only)."""
+        with self.lock:
+            if reuse and self._last_full is not None and self._full_run == self._runs and not force_content:
+                return self._last_full
+            content = force_content or self._n_objects <= CONTENT_MAX
+            path = STATE / "live" / "content.svg"
+            acts: list = ["query-all"]
+            if content:
+                acts += list(CONTENT_EXPORT) + [("export-filename", str(path)), ("export-do", None)]
+            key0 = _stat_key(path)
+            order, boxes, text = self._query(self.run(acts))
+            self._content_ok = content and _stat_key(path) not in (None, key0)
+            stamp = None
+            if len(order) > CONTENT_MAX:
+                self.untracked_reason = f"{len(order):,} objects, over the {CONTENT_MAX:,} limit for content tracking"
+            elif not self._content_ok:
+                self.untracked_reason = "Inkscape wrote no content export"
+            else:
+                stamp = hashlib.sha1(path.read_bytes()).hexdigest()
+            self.content_tracked = stamp is not None
+            self.revision = (hashlib.sha1(f"{self.geom_rev}|{stamp}".encode()).hexdigest()[:12] if stamp
+                             else self.geom_rev)
+            self._snapshots[self.revision] = text
+            self._snapshots.move_to_end(self.revision)
+            while len(self._snapshots) > SNAPSHOTS:
+                self._snapshots.popitem(last=False)
+            for d in self._fresh:
+                self.tree_rev[d] = self.revision
+            self._fresh.clear()
+            self._full_run, self._last_full = self._runs, (order, boxes)
+            return order, boxes
+
+    def full_boxes(self, force_content: bool = False):
+        """full_read() with groups that contain a nested <svg> rebuilt from their children."""
+        order, boxes = self.full_read(force_content=force_content)
+        boxes = dict(boxes)
+        t = self.trees.get(self.active_doc())
+        if t is not None:
+            t.correct_boxes(boxes)
         return order, boxes
 
     def boxes(self) -> tuple[list[str], dict[str, Box]]:
@@ -364,7 +513,9 @@ class Inkscape:
             prior = self.selection() if restore else []
             self.select(ids)
             try:
-                return self.run(actions)
+                out = self.run(actions)
+                self.last_action_stderr = self.bus.last_stderr  # before restoring the selection overwrites it
+                return out
             finally:
                 if restore:
                     try:
@@ -420,15 +571,19 @@ class Inkscape:
             if t is not None:
                 t.correct_boxes(now)
             lines = self._diff_lines(snap[1], order, now, t, top=8, per_delta=6)
-            what = "\n".join(lines) if lines else "(the difference is below 0.01 mm)"
+            what = "\n".join(lines) if lines else (
+                "No object moved, resized, appeared or vanished: the change is in what they show at the same "
+                "boxes (text, colour, an image, a same-box transform). changes(deep=True) lists text and style "
+                "differences.")
         raise RevisionConflict(
             f"Refused, nothing was edited: the document changed since revision {expected_revision} "
             f"(it is now {self.revision}). Changes since then:\n{what}\n"
             f"Re-check the objects you meant to edit, then retry with expected_revision={self.revision}.")
 
-    def guarded_boxes(self, expected_revision: str | None):
-        """Read the live boxes, then apply the revision guard."""
-        order, boxes = self.boxes()
+    def guarded_boxes(self, expected_revision: str | None, force_content: bool = False):
+        """Read the live boxes and the revision, then apply the revision guard."""
+        order, boxes = self.full_boxes(force_content=force_content)
+        self._pre_rev = self.revision
         self.guard(expected_revision)
         return order, boxes
 
@@ -436,6 +591,23 @@ class Inkscape:
     def _settle_pending(self, wait: float = 30.0):
         """A previous bridge call timed out: wait until Inkscape has finished it (its D-Bus reply comes
         only after the document holds the result) before sending anything that edits or reads it."""
+        native = getattr(self.bus, "pending", None)
+        if native is not None:
+            name = getattr(self.bus, "pending_name", None) or "?"
+            try:
+                done, how = native.wait(wait), "finished"
+            except Exception:  # it ended with a D-Bus error: no longer running either way
+                done, how = True, "ended with an error"
+            if not done:
+                raise UncertainCompletion(
+                    f"UNCERTAIN COMPLETION: an earlier command ({name}) that did not finish in time is still "
+                    "running in Inkscape, so I have not sent another. Look at the window (a dialog may be open) "
+                    "or call changes; try again once it has finished.")
+            self.bus.pending = self.bus.pending_name = None
+            self.trees.clear()
+            self.notes.append(f"Late landing: the earlier command '{name}' that timed out has since {how} in "
+                              "Inkscape, so it may have applied after all. Check with changes before building "
+                              "on what that call reported.")
         if not self._pending:
             return
         try:
@@ -445,17 +617,33 @@ class Inkscape:
         if done:
             self._pending = None
             self.trees.clear()  # it may have changed the document after all
+            self.notes.append("Late landing: the earlier edit that timed out has since finished: "
+                              + self._late_bridge_outcome() + " Check with changes before building on it.")
             return
         raise UncertainCompletion(
             "UNCERTAIN COMPLETION: an earlier edit that did not finish in time is still running in "
             "Inkscape, so I have not sent another. Look at the window (a dialog may be open) or call "
             "changes; try again once it has finished.")
 
+    def _late_bridge_outcome(self) -> str:
+        try:
+            r = json.loads((STATE / "bridge" / "response.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            r = None
+        rid, self._pending_rid = self._pending_rid, None
+        if not r or r.get("id") != rid:
+            return "the extension left no answer for it (it may not have run)."
+        if not r.get("ok"):
+            return "it FAILED and left the document untouched."
+        if r.get("noop") or not r.get("changed"):
+            return "it changed nothing."
+        return "it APPLIED (one undo step)."
+
     def bridge(self, ops: list[dict], doc: str | None = None, dump: bool = True, timeout: float = 900) -> dict:
         """Run a batch through the bridge extension. Raises InkError if the batch failed (document
         untouched) and UncertainCompletion if Inkscape did not answer within `timeout` seconds."""
         with self.lock:
-            self.bus.require()
+            self._require()
             self._settle_pending()
             doc = doc or self.active_doc()
             br = STATE / "bridge"
@@ -480,7 +668,7 @@ class Inkscape:
                 raise InkError("The bridge extension is not loaded in this Inkscape: run install.sh, then quit "
                                "and reopen Inkscape (Claude), which reads extensions at startup.") from None
             except CallTimeout as e:
-                self._pending = e.call
+                self._pending, self._pending_rid = e.call, rid
                 self.trees.pop(doc, None)
                 raise uncertain from None
             t1 = time.monotonic()  # Inkscape has finished: the response is already written, or never will be
@@ -506,6 +694,7 @@ class Inkscape:
                 order, _ = self.raw_boxes()
                 self.trees[doc] = Tree.from_file(cache, "bridge")
                 self.tree_ids[doc] = order
+                self._fresh.add(doc)
             elif r.get("changed"):
                 self.trees.pop(doc, None)
             return r
@@ -513,8 +702,14 @@ class Inkscape:
     def bridge_edit(self, ops: list[dict], before: dict[str, Box], expect_added=(), timeout: float = 900,
                     dump: bool = True) -> tuple[dict, Edit]:
         """A mutating bridge batch plus its landed verdict (before = boxes read before the batch)."""
+        pre = self._pre_rev
         r = self.bridge(ops, dump=dump, timeout=timeout)
         _, after = self.boxes()
+        doc = self.active_doc()
+        ours = doc in self.trees and doc not in self._fresh and pre is not None and self.tree_rev.get(doc) == pre
+        self.full_read()
+        if ours:
+            self.tree_rev[doc] = self.revision
         self.remember(after)
         if r.get("noop"):
             verdict = "No change: the batch left the document byte-identical, so no undo step was added."
@@ -530,13 +725,20 @@ class Inkscape:
 
     # ======================================================================== structure (cached)
     def tree(self, refresh: bool = False) -> tuple[Tree, list[str], dict[str, Box], str]:
-        """The document tree plus fresh boxes. Re-reads the tree when the set of ids has changed."""
+        """The document tree plus fresh boxes. Re-reads the tree when the document changed in a way this
+        server did not make itself (any change, text and colour included, while content is tracked; a
+        change in the set of ids otherwise)."""
         with self.lock:
             doc = self.active_doc()
-            order, boxes = self.raw_boxes()
+            order, boxes = self.full_read()
+            boxes = dict(boxes)
             t = self.trees.get(doc)
-            if t is None or refresh or self.tree_ids.get(doc) != order:
+            if (t is None or refresh or self.tree_ids.get(doc) != order
+                    or (self.content_tracked and self.tree_rev.get(doc) != self.revision)):
                 t = self._refresh_tree(doc, order)
+                self._fresh.discard(doc)
+                self.tree_rev[doc] = self.revision
+                self._full_run = self._runs  # the refresh only read: the revision above still stands
             t.correct_boxes(boxes)
             return t, order, boxes, doc
 
@@ -596,6 +798,13 @@ class Inkscape:
             pass
 
     def _done(self, steps, before, after, verdict, ids=()) -> Edit:
+        pre = self._pre_rev
+        self.full_read(reuse=True)
+        # This edit was ours: if the cached tree matched the document just before it, it still answers
+        # for text, style and structure (tools that change those patch it or drop it themselves).
+        doc = self.active_doc()
+        if doc in self.trees and pre is not None and self.tree_rev.get(doc) == pre:
+            self.tree_rev[doc] = self.revision
         self.remember(after)
         return Edit(steps, before, after, verdict, self.revision, list(ids))
 
@@ -853,32 +1062,81 @@ class Inkscape:
         return ex, ey
 
     # ======================================================================== style / attributes
+    def _styles_of(self, ids) -> dict[str, dict[str, str]] | None:
+        """Each id's style as the last full read's plain-SVG export holds it (presentation attributes as a
+        fallback); None when that read wrote no export."""
+        from lxml import etree
+        path = STATE / "live" / "content.svg"
+        if not self._content_ok:
+            return None
+        want, out = set(ids), {}
+        for el in etree.parse(str(path), etree.XMLParser(huge_tree=True)).getroot().iter():
+            i = el.get("id") if isinstance(el.tag, str) else None
+            if i in want:
+                st = {k: v for k, v in el.attrib.items() if "}" not in k}
+                st.update(parse_style(el.get("style")))
+                out[i] = st
+        return out
+
     def style(self, ids, props: dict, *, expected_revision: str | None = None) -> Edit:
-        _, before = self.guarded_boxes(expected_revision)
+        """Set style properties, then read every value back from the live document. Inkscape's
+        object-set-property splits its argument on commas and refuses anything with more than one (a dash
+        list, rgb(), a font list), so those values go through the bridge with the removals."""
+        _, before = self.guarded_boxes(expected_revision, force_content=True)
         self._check_ids(ids, before)
-        removals = {k: v for k, v in props.items() if v is None}
-        sets = {k: v for k, v in props.items() if v is not None}
-        steps = 0
-        if sets:
-            self.with_selection(list(ids), [("object-set-property", f"{k},{v}") for k, v in sets.items()])
-            steps += len(sets)
-        if removals:
-            r = self.bridge([{"op": "set_style", "ids": list(ids), "props": removals}])
+        was = self._styles_of(ids) or {}
+        native = {k: v for k, v in props.items() if v is not None and "," not in str(v) and ";" not in str(v)}
+        rest = {k: v for k, v in props.items() if k not in native}
+        steps, said = 0, []
+        if native:
+            self.with_selection(list(ids), [("object-set-property", f"{k},{v}") for k, v in native.items()])
+            said, _ = inkscape_said(self.last_action_stderr)
+            steps += len(native)
+        if rest:
+            r = self.bridge([{"op": "set_style", "ids": list(ids), "props": rest}])
             steps += 1 if r.get("changed") else 0
-        doc = self.active_doc()
-        t = self.trees.get(doc)
-        if t is not None and sets:  # keep the cached tree honest about what we just changed
-            from .svgtree import parse_style
-            for i in ids:
-                el = t.ids.get(i)
-                if el is not None:
-                    st = parse_style(el.get("style"))
-                    st.update({k: str(v) for k, v in sets.items()})
-                    el.set("style", ";".join(f"{k}:{v}" for k, v in st.items()))
         _, after = self.boxes()
-        return self._done(steps, before, after, landed(
-            before, after, touched=ids, unchanged="a colour or opacity change has no geometric trace, and "
-                                                  "geometry is all Inkscape reports back."))
+        self.full_read(force_content=True)
+        now = self._styles_of(ids)
+        if now is None:
+            verdict = "Landed: unconfirmed — the document could not be read back to check the values."
+        else:
+            refused, renamed, ok = [], [], 0
+            for i in ids:
+                for k, want in props.items():
+                    have, old = now.get(i, {}).get(k), was.get(i, {}).get(k)
+                    if want is None:
+                        ok += have is None
+                        if have is not None:
+                            refused.append(f"{k} on {i} is still '{have}'")
+                    elif have is not None and norm_css(have) == norm_css(want):
+                        ok += 1
+                        if have != str(want):
+                            renamed.append(f"{k} on {i} stored as '{have}'")
+                    else:
+                        refused.append(f"{k}={want} on {i} (" + (f"still '{have}'" if have == old and have is not None
+                                       else f"now '{have}'" if have is not None else "not set") + ")")
+            if refused:
+                verdict = ("NOT LANDED as planned: Inkscape did not take " + "; ".join(refused[:6])
+                           + (f" (it said: {' | '.join(said)})" if said else "")
+                           + (f". {ok} other value(s) read back as set." if ok else "."))
+            else:
+                verdict = (f"Landed: confirmed ({ok} value(s) read back from the live document"
+                           + ("; " + "; ".join(renamed[:6]) if renamed else "") + ").")
+            t = self.trees.get(self.active_doc())
+            if t is not None:  # keep the cached tree to what the document holds, never to what was asked
+                for i in ids:
+                    el = t.ids.get(i)
+                    if el is None or i not in now:
+                        continue
+                    st = parse_style(el.get("style"))
+                    for k in props:
+                        if now[i].get(k) is None:
+                            st.pop(k, None)
+                        else:
+                            st[k] = now[i][k]
+                    el.set("style", ";".join(f"{k}:{v}" for k, v in st.items()))
+        return self._done(steps, before, after, verdict)
 
     def attributes(self, ids, attrs: dict, *, expected_revision: str | None = None) -> Edit:
         _, before = self.guarded_boxes(expected_revision)
@@ -971,14 +1229,13 @@ class Inkscape:
             raise InkError("op is undo or redo")
         _, before = self.guarded_boxes(expected_revision)
         rev0 = self.revision
-        with self.lock:
-            for _ in range(max(1, int(n))):
-                self.bus.activate(op, path=doc, timeout=900)
+        self.run([op] * max(1, int(n)), path=doc)
         self.trees.pop(doc, None)
         _, after = self.boxes()
+        self.full_read()
         verdict = (f"Landed: confirmed (revision {rev0} → {self.revision})." if self.revision != rev0 else
-                   "Landed: unconfirmed — no geometry changed (a colour-only step, or nothing to "
-                   f"{op}).")
+                   "Landed: unconfirmed — the document did not change (nothing to " + op + "?)"
+                   + ("" if self.content_tracked else "; only geometry is tracked on this document") + ".")
         return self._done(max(1, int(n)), before, after, verdict)
 
     # ======================================================================== renders
@@ -996,7 +1253,23 @@ class Inkscape:
         self.run(acts)
         if not path.exists():
             raise InkError(f"render produced no file; see {STATE / 'inkscape.err.log'}")
+        self._prune_renders()
         return path
+
+    @staticmethod
+    def _prune_renders(keep: int = KEEP_RENDERS, batch: int = PRUNE_BATCH):
+        """Move all but the newest `keep` default-named renders and window shots out of STATE/renders once
+        `batch` more have piled up. A path the caller chose is never touched; a failed move is ignored (the
+        render itself already succeeded)."""
+        files = [p for pat in ("render-*.png", "window-*.png") for p in (STATE / "renders").glob(pat)]
+        if len(files) < keep + batch:
+            return
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        try:
+            subprocess.run(["quarantine", "-m", "inkscape-live-mcp: old render cache (images were returned inline)"]
+                           + [str(p) for p in files[keep:]], capture_output=True, timeout=60)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def window_shot(self, path: Path | None = None) -> Path:
         titles = self.window_titles()
@@ -1004,6 +1277,7 @@ class Inkscape:
             raise InkError("no visible Inkscape (Claude) window found")
         path = path or (STATE / "renders" / f"window-{int(time.time() * 1000)}.png")
         subprocess.run(["screencapture", "-x", "-o", f"-l{titles[0][0]}", str(path)], check=True, timeout=30)
+        self._prune_renders()
         return path
 
     def drawing_box(self, boxes: dict[str, Box]) -> Box:
@@ -1151,11 +1425,13 @@ class Inkscape:
         out = self.run(acts)
         rejected, said = inkscape_said(self.bus.last_stderr)
         self.trees.pop(self.active_doc(), None)
-        self.raw_boxes()
-        effect = (f"Geometry changed (revision {rev0} → {self.revision})." if self.revision != rev0 else
-                  "No geometric change. Expected for selection, export or colour actions; if you expected "
-                  "something to move, check the arguments: Inkscape 1.4 ignores some malformed ones without "
-                  "a message (a bare or misspelled object-align does nothing).")
+        self.full_read()
+        effect = (f"The document changed (revision {rev0} → {self.revision})." if self.revision != rev0 else
+                  "Nothing in the document changed"
+                  + ("" if self.content_tracked else " geometrically (only geometry is tracked here)")
+                  + ". Expected for selection or export actions; if you expected a change, check the arguments: "
+                  "Inkscape 1.4 ignores some malformed ones without a message (a bare or misspelled "
+                  "object-align does nothing).")
         if rejected:
             raise InkError("Inkscape rejected an action: " + " | ".join(rejected)
                            + f"\nActions listed before it may have run. {effect}")
@@ -1234,7 +1510,7 @@ class Inkscape:
         with self.lock:
             doc = self.active_doc()
             old_tree = self.trees.get(doc)
-            order, boxes = self.boxes()
+            order, boxes = self.full_boxes()
             rev = self.revision
             prev = since_revision or self.base_rev.get(doc)
             if since_revision:
@@ -1274,6 +1550,12 @@ class Inkscape:
                 if diffs:
                     lines.append(f"TEXT/STYLE CHANGES ({len(diffs)}):")
                     lines += diffs[:60]
-            body = "\n".join(lines) if lines else "No geometric changes." + (
-                "" if deep else " (Text/colour-only edits need deep=True.)")
+            if lines:
+                body = "\n".join(lines)
+            elif prev and prev != rev:
+                body = ("No object moved, resized, appeared or vanished, but what they show changed (text, colour, "
+                        "an image or a same-box transform)." + ("" if deep else " deep=True lists text and style edits."))
+            else:
+                body = "No changes." if self.content_tracked else (
+                    "No geometric changes (only geometry is tracked on this document; deep=True compares text and style).")
             return head + "\n" + body

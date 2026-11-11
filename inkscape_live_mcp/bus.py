@@ -26,6 +26,9 @@ TAG = os.environ.get("INKSCAPE_MCP_TAG", "claude")
 APP_NAME = f"org.inkscape.Inkscape.{TAG}"
 APP_PATH = f"/org/inkscape/Inkscape/{TAG}"
 ACTIONS_IFACE = "org.gtk.Actions"
+# Native actions take 0.1-1 s; a minute without an answer means a dialog or a hung Inkscape, not a slow
+# action. (It was 600 s, so a held window cost ten minutes before the agent heard anything.)
+NATIVE_TIMEOUT = float(os.environ.get("INKSCAPE_MCP_NATIVE_TIMEOUT", 60))
 
 
 class NotRunning(RuntimeError):
@@ -144,6 +147,10 @@ class InkscapeBus:
         self.out = OutLog(STATE / "inkscape.out.log")
         self.err = OutLog(STATE / "inkscape.err.log")
         self.last_stderr = ""  # what Inkscape wrote to stderr during the last run()
+        self.owner: str | None = None   # unique bus name of the running Inkscape; changes when it restarts
+        self.generation = 0             # bus connections opened so far (a broken bus means a new daemon)
+        self.pending: PendingCall | None = None  # a native Activate that timed out and may still land
+        self.pending_name: str | None = None
 
     # ---- connection -------------------------------------------------------------------------
     def connect(self):
@@ -152,6 +159,7 @@ class InkscapeBus:
         if not self.socket.exists():
             raise NotRunning(f"No bus socket at {self.socket}. Open 'Inkscape (Claude)' or call launch(path).")
         self.conn = open_connection(self.socket)
+        self.generation += 1
         return self.conn
 
     def reset(self):
@@ -163,27 +171,62 @@ class InkscapeBus:
         self.conn = None
         self._describe.clear()
 
-    def _call(self, dest, path, iface, method, sig=None, body=(), timeout=600.0):
-        conn = self.connect()
+    def _call(self, dest, path, iface, method, sig=None, body=(), timeout=NATIVE_TIMEOUT):
         msg = new_method_call(DBusAddress(path, bus_name=dest, interface=iface), method, sig, body)
         try:
-            return unwrap_msg(conn.send_and_get_reply(msg, timeout=timeout))
-        except TimeoutError:
-            # The call reached Inkscape and may still complete: never re-send it (a retried move would
-            # apply twice). Drop the connection so its late reply cannot be mistaken for another's.
-            self.reset()
-            raise
+            conn = self.connect()
+            serial = next(conn.outgoing_serial)
+            conn.send_message(msg, serial=serial)
+            reply = self._await(conn, serial, timeout)
         except (OSError, ConnectionError):
             self.reset()
             conn = self.connect()
-            return unwrap_msg(conn.send_and_get_reply(msg, timeout=timeout))
+            serial = next(conn.outgoing_serial)
+            conn.send_message(msg, serial=serial)
+            reply = self._await(conn, serial, timeout)
+        if reply is None:
+            # The call reached Inkscape and may still complete: never re-send it (a retried move would
+            # apply twice). An action keeps its connection as a pending call, so the next command can wait
+            # for it and report that it landed late; anything else just drops the connection.
+            if method == "Activate":
+                if self.pending is not None:
+                    self.pending.close()
+                self.pending, self.pending_name = PendingCall(conn, serial), str(body[0])
+                self.conn = None
+                self._describe.clear()
+            else:
+                self.reset()
+            raise TimeoutError(f"no reply to {method} within {timeout:.0f} s")
+        return unwrap_msg(reply)
+
+    @staticmethod
+    def _await(conn: DBusConnection, serial: int, timeout: float):
+        """The reply to `serial`, or None if it has not arrived within `timeout` seconds."""
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            try:
+                msg = conn.receive(timeout=left)
+            except TimeoutError:
+                return None
+            if msg.header.fields.get(HeaderFields.reply_serial) == serial:
+                return msg
 
     def running(self) -> bool:
+        """True when Inkscape (Claude) owns its bus name; records that owner's unique name, which a
+        restarted Inkscape does not share, so the client can drop what it cached about the old one."""
         try:
-            (has,) = self._call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                                "NameHasOwner", "s", (APP_NAME,), timeout=5)
-            return bool(has)
-        except (NotRunning, OSError, ConnectionError, DBusErrorResponse):
+            (owner,) = self._call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                                  "GetNameOwner", "s", (APP_NAME,), timeout=5)
+            self.owner = str(owner)
+            return True
+        except DBusErrorResponse:  # NameHasNoOwner: the bus is up, Inkscape is not
+            self.owner = None
+            return False
+        except (NotRunning, OSError, ConnectionError):
+            self.owner = None
             self.reset()
             return False
 
@@ -210,7 +253,7 @@ class InkscapeBus:
     def action_names(self, path: str = APP_PATH) -> dict[str, str]:
         return dict(self._param_types(path))
 
-    def activate(self, name: str, value=None, path: str = APP_PATH, timeout: float = 600.0):
+    def activate(self, name: str, value=None, path: str = APP_PATH, timeout: float = NATIVE_TIMEOUT):
         """Activate one action; `value` is coerced to the action's declared parameter type."""
         self._call(APP_NAME, path, ACTIONS_IFACE, "Activate", "sava{sv}", (name, self._params(name, value, path), {}),
                    timeout=timeout)

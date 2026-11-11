@@ -62,16 +62,22 @@ agent the workflow (route by cost, lay out by numbers, share the window safely).
 ### Safety nets on every call
 
 - **Revision guard.** Every read and edit ends with `revision <id>`, a fingerprint of every object's id
-  and visual box in paint order, read live from Inkscape. Every editing tool takes an optional
-  `expected_revision`; if the document no longer matches it, the tool refuses, changes nothing, and
-  lists what changed since (moved/added/removed objects). `changes` reports the current revision and
+  and visual box in paint order plus a hash of the document as Inkscape serialises it (a plain-SVG export,
+  so retyped text, colours, replaced images and same-box transforms count; zoom, scrolling, selection,
+  labels and layer locks do not). Every editing tool takes an optional `expected_revision`; if the
+  document no longer matches it, the tool refuses, changes nothing, and lists what changed since
+  (moved/added/removed objects, or "what they show changed" for a same-box edit). The check and the
+  edit run under one lock, so another agent cannot slip an edit between them. Documents over 15,000
+  objects (`INKSCAPE_MCP_CONTENT_MAX`) fall back to geometry only, and every result says so. `changes` reports the current revision and
   makes it the new baseline; `changes(since_revision=…)` diffs against any revision read this session.
   `history` takes it too, so an undo never takes back something you did after the agent's edit.
 - **Landed verification.** After each edit the touched objects' live boxes are compared with what the
   edit planned: exact positions for moves and gaps, a shared edge for alignment, equal spacing for
   distribution, new ids present and deleted ids gone for inserts and deletes. The result says
   `Landed: confirmed`, `NOT LANDED as planned: …` (with what is where), or `Landed: unconfirmed` for an
-  edit with no geometric trace, such as a colour.
+  edit with no geometric trace, such as an attribute. `style` reads every value back from the live
+  document and says NOT LANDED for any value Inkscape did not take; values containing commas (dash lists,
+  `rgb(…)`, font lists), which Inkscape's own style action refuses, go through the bridge.
 - **No-op batches add no undo step.** The bridge compares the document before and after a batch; if it
   is byte-identical it hands nothing back, so Inkscape adds no undo entry and your next Cmd+Z still
   undoes the last real change.
@@ -83,7 +89,11 @@ agent the workflow (route by cost, lay out by numbers, share the window safely).
   reports whether the geometry changed, because Inkscape ignores some malformed arguments without a word.
 - **Uncertain completion is reported, never retried.** If Inkscape does not answer in time (a dialog is
   open, a huge document), the call returns `UNCERTAIN COMPLETION` instead of an error or a silent retry:
-  the edit may still apply. The next call waits for Inkscape to finish it before reading or editing.
+  the edit may still apply. Native commands wait 60 s (`INKSCAPE_MCP_NATIVE_TIMEOUT`), bridge edits up to
+  15 min. The next call waits for Inkscape to finish the earlier one before reading or editing, and its
+  result starts with "Late landing: …" (for a bridge edit: whether it applied, failed or changed nothing).
+- **A restarted Inkscape is noticed.** The server tracks Inkscape's unique bus name; when it changes, every
+  cached page size, name, tree and box set is dropped and re-read.
 
 ## Cost model
 
@@ -93,6 +103,7 @@ image), Apple Silicon laptop, through the MCP server:
 | Operation | Time |
 |---|---|
 | status | 0.3 s |
+| content hash added to each call's revision (plain-SVG export, measured headless 2026-11-10) | ~2 s at 50k objects, ~0.2 s at 5k, tens of ms on a figure |
 | align / move / style (native) | 0.6–0.7 s |
 | distribute five panels to an exact gap | 1.1 s |
 | changes (geometry diff) | 0.3 s |
@@ -106,7 +117,8 @@ image), Apple Silicon laptop, through the MCP server:
 | export the page as PDF / one panel as PDF (via a headless copy) | 3.4 s / 3.0 s |
 | export the page as PNG at 150 dpi | 1.1 s |
 
-On a 2,000-object figure everything is under 0.6 s. Bridge edits grow with document size, because
+The table predates the content hash (2026-10-06); add its row to each call on documents under the 15,000-object
+limit. On a 2,000-object figure everything is under 0.6 s. Bridge edits grow with document size, because
 Inkscape serialises the whole document to the extension and reloads its result: on a real 100,000-element
 poster with heavily clipped figures one bridge edit took about 16 s. So **batch content edits**: `text`
 takes a list, `add_svg` and `python` take many elements at once.
@@ -163,11 +175,11 @@ takes a list, `add_svg` and `python` take many elements at once.
 ## Limitations
 
 - **macOS only.** On Linux the same D-Bus mechanism works natively; see Related work.
-- **The revision sees geometry, not paint.** A colour-only or attribute-only edit you make does not change
-  the revision, and `Landed` cannot confirm such an edit. `changes(deep=True)` re-reads the document and
-  reports text and style differences.
-- The guard is a check, not a lock: an edit you make in the milliseconds between the check and the
-  agent's edit is not caught.
+- **The revision ignores what Inkscape's plain SVG drops** (labels, layer locks, other `inkscape:`
+  attributes), and over 15,000 objects it covers geometry only. `changes(deep=True)` re-reads the document
+  and reports text and style differences.
+- The guard is a check, not a lock against you: an edit you make in the milliseconds between the check
+  and the agent's edit is not caught (another agent's is: both hold the same lock).
 - Bridge edits reload the whole document: seconds on large documents (see Cost model).
 - Tools act on the **front** window. With several documents open, the front one is identified from the
   window title; click the window you want if it is ambiguous.
@@ -184,7 +196,8 @@ takes a list, `add_svg` and `python` take many elements at once.
 ## Tests
 
 ```sh
-.venv/bin/python tests/test_units.py   # no Inkscape needed
+.venv/bin/python tests/test_units.py      # no Inkscape needed
+.venv/bin/python tests/test_bundlefix.py  # no Inkscape needed: a fake bus
 .venv/bin/python tests/e2e.py          # 62 checks over MCP on a private Inkscape instance
 .venv/bin/python tests/bench.py        # the cost table above
 ```
@@ -216,9 +229,10 @@ quit it afterwards (`--keep` leaves it open). They never touch a window you have
 `launch.sh` (bus + Inkscape) · `install.sh` · `run_server.py` (entry point) · `inkscape_live_mcp/`
 (`bus.py` D-Bus and stdout log, `client.py` operations, revision guard and landed checks, `svgtree.py`
 tree and box model, `server.py` MCP tools) · `extension/` (`claude_bridge.inx/.py`) · `tests/`
-(`_instance.py` private test instance, `e2e.py`, `bench.py`, `test_units.py`, `fixtures/`) ·
+(`_instance.py` private test instance, `e2e.py`, `bench.py`, `test_units.py`, `test_bundlefix.py`, `fixtures/`) ·
 `skills/inkscape-live/SKILL.md` (a Claude Code skill for using the tools well).
-State and logs: `~/.inkscape-mcp/` (`inkscape.out.log`, `inkscape.err.log`, `bridge/bridge.log`, renders).
+State and logs: `~/.inkscape-mcp/` (`inkscape.out.log`, `inkscape.err.log`, `bridge/bridge.log`, `live/content.svg`
+(the last content export), renders: the newest 20 are kept, older ones are moved out with `quarantine`).
 
 ## Troubleshooting
 

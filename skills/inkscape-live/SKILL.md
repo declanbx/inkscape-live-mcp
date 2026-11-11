@@ -26,12 +26,13 @@ read live from Inkscape. To drive it from a script instead, put the checkout on 
   (`changes`), re-plan, retry with the new revision. Never retry a refused edit blindly.
 - Pass `expected_revision` to `history` (undo) as well, so you never undo the user's work.
 - Read each edit's verdict: `Landed: confirmed` (done as planned), `NOT LANDED as planned` (look before
-  doing anything else), `Landed: unconfirmed` (a colour or attribute change; render to check if it
-  matters).
+  doing anything else), `Landed: unconfirmed` (an attribute change; render if it matters). `style` reads its values back: NOT LANDED there means Inkscape refused the value.
 - `UNCERTAIN COMPLETION` means Inkscape did not answer in time: the edit may still apply. Do not repeat
   it; call `window` (a dialog may be open) or `changes`, then decide.
-- The revision tracks geometry only: a colour-only change by the user does not alter it. `changes(deep=True)`
-  reports text and style differences.
+- The revision covers geometry AND content (text, colour, images, same-box transforms), so a retyped
+  number or a recoloured panel refuses a guarded edit. Over 15,000 objects it covers geometry only and
+  each result says "(geometry only: …)". `changes(deep=True)` lists text and style differences.
+- A result starting "Late landing:" means an earlier timed-out edit has since finished: check `changes`.
 
 ## Choose the route by cost (this decides every call)
 
@@ -39,7 +40,7 @@ read live from Inkscape. To drive it from a script instead, put the checkout on 
 |---|---|---|
 | native | align, distribute, move, resize (aspect kept), style, attributes, structure, history, selection | ~0.1–1 s, one undo step each |
 | bridge (reloads the whole document) | text, insert, add_svg, python, reparent, stretch | ~0.5 s on a small file, 3–16 s on a big poster |
-| read | find, inspect, outline, changes; render ~1 s | first read of an edited big file a few s, then cached |
+| read | find, inspect, outline, changes; render ~1 s | each call adds a content hash: tens of ms on a figure, ~0.2 s at 5k objects, ~0.6 s at 15k; the tree is re-read after the user edits |
 
 So: batch every bridge edit into one call (`text` takes a list; `python`/`add_svg` take many elements).
 
